@@ -18,11 +18,12 @@ from audio_separator.separator import Separator
 MODEL_DIR = os.environ.get("MODEL_DIR", "/app/models")
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "model_bs_roformer_ep_317_sdr_12.9755.ckpt")
 DEFAULT_CATBOX_USER_HASH = os.environ.get("CATBOX_KEY", "")
+MAX_CONCURRENCY = max(1, int(os.environ.get("MAX_CONCURRENCY", "1")))
 
 pathlib.Path(MODEL_DIR).mkdir(parents=True, exist_ok=True)
 
 print("=" * 60)
-print("🚀 Initializing BS-RoFormer Serverless Worker (Sequential Queue, Concurrency=1)")
+print(f"🚀 Initializing BS-RoFormer Serverless Worker (Max Concurrency: {MAX_CONCURRENCY})")
 print(f"📦 PyTorch Version   : {torch.__version__}")
 print(f"⚡ CUDA Available    : {torch.cuda.is_available()}")
 if torch.cuda.is_available():
@@ -341,8 +342,16 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             torch.cuda.empty_cache()
 
 
+def concurrency_controller(current_concurrency):
+    return MAX_CONCURRENCY
+
+
 if __name__ == "__main__":
-    print("🚀 Starting Serverless Worker (Sequential Queue, Concurrency=1)...")
-    runpod.serverless.start({
+    print(f"🚀 Starting Serverless Worker (Max Concurrency: {MAX_CONCURRENCY})...")
+    start_params = {
         "handler": handler,
-    })
+    }
+    if MAX_CONCURRENCY > 1:
+        start_params["concurrency_modifier"] = concurrency_controller
+
+    runpod.serverless.start(start_params)
