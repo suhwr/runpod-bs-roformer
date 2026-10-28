@@ -1,7 +1,7 @@
 # ==============================================================================
 # Ultra-Optimized BS-RoFormer Serverless Worker
 # Architecture: Band-Split RoPE Transformer (ByteDance / UVR)
-# SOTA Models: BS-RoFormer ViperX 12.97 SDR & Mel-Band RoFormer Kim
+# SOTA Model: BS-RoFormer ViperX 12.97 SDR
 # ==============================================================================
 FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
@@ -39,17 +39,20 @@ WORKDIR /app
 
 # 2. Install PyTorch with CUDA 12.4 explicitly (prevents CPU-only wheel fallback)
 RUN python3 -m pip install --no-cache-dir \
-    torch==2.4.1 torchaudio==2.4.1 \
-    --index-url https://download.pytorch.org/whl/cu124
+    --index-url https://download.pytorch.org/whl/cu124 \
+    --extra-index-url https://pypi.org/simple \
+    torch==2.4.1 torchaudio==2.4.1
 
-# 3. Install worker dependencies
+# 3. Install worker dependencies while keeping CUDA PyTorch pinned
 COPY requirements.txt /app/requirements.txt
-RUN python3 -m pip install --no-cache-dir -r /app/requirements.txt
+RUN python3 -m pip install --no-cache-dir \
+    --extra-index-url https://download.pytorch.org/whl/cu124 \
+    -r /app/requirements.txt
 
-# 4. Pre-download SOTA BS-RoFormer models into image layer
+# 4. Pre-download SOTA BS-RoFormer ViperX 12.97 SDR model into image layer
 # Baking models directly eliminates cold-start model downloads at runtime (Zero Cold-Start!)
 RUN mkdir -p /app/models && \
-    python3 -c "from audio_separator.separator import Separator; s = Separator(model_file_dir='/app/models'); s.load_model('model_bs_roformer_ep_317_sdr_12.9755.ckpt'); s.load_model('mel_band_roformer_kim_ft_unfrozen.ckpt')"
+    python3 -c "from audio_separator.separator import Separator; s = Separator(model_file_dir='/app/models'); s.load_model('model_bs_roformer_ep_317_sdr_12.9755.ckpt')"
 
 # 5. Copy handler and assets
 COPY handler.py /app/handler.py
