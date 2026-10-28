@@ -19,7 +19,7 @@ from audio_separator.separator import Separator
 MODEL_DIR = os.environ.get("MODEL_DIR", "/app/models")
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "model_bs_roformer_ep_317_sdr_12.9755.ckpt")
 DEFAULT_CATBOX_USER_HASH = os.environ.get("CATBOX_KEY", "")
-MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "2"))
+MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "3"))
 
 pathlib.Path(MODEL_DIR).mkdir(parents=True, exist_ok=True)
 
