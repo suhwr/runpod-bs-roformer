@@ -19,12 +19,15 @@ from audio_separator.separator import Separator
 MODEL_DIR = os.environ.get("MODEL_DIR", "/app/models")
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "model_bs_roformer_ep_317_sdr_12.9755.ckpt")
 DEFAULT_CATBOX_USER_HASH = os.environ.get("CATBOX_KEY", "")
-MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "3"))
+DEFAULT_FALLBACK_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "3"))
+MAX_CONCURRENCY_CAP = int(os.environ.get("MAX_CONCURRENCY_CAP", "6"))
+VRAM_PER_JOB_GB = float(os.environ.get("VRAM_PER_JOB_GB", "2.5"))
+SAFETY_BUFFER_GB = float(os.environ.get("SAFETY_BUFFER_GB", "2.0"))
 
 pathlib.Path(MODEL_DIR).mkdir(parents=True, exist_ok=True)
 
 print("=" * 60)
-print("🚀 Initializing BS-RoFormer Serverless Worker (Concurrent-Ready)")
+print("🚀 Initializing BS-RoFormer Serverless Worker (Dynamic VRAM Concurrency)")
 print(f"📦 PyTorch Version   : {torch.__version__}")
 print(f"⚡ CUDA Available    : {torch.cuda.is_available()}")
 if torch.cuda.is_available():
@@ -32,7 +35,8 @@ if torch.cuda.is_available():
     print(f"🧠 Total VRAM        : {torch.cuda.get_device_properties(0).total_memory / (1024**3):.2f} GB")
 print(f"📂 Model Directory   : {MODEL_DIR}")
 print(f"🎯 Default Model     : {DEFAULT_MODEL}")
-print(f"🔀 Max Concurrency   : {MAX_CONCURRENCY} concurrent jobs per worker")
+print(f"🔀 Fallback Concurr  : {DEFAULT_FALLBACK_CONCURRENCY} (Max Cap: {MAX_CONCURRENCY_CAP})")
+print(f"⚖️ VRAM Buffer Rules : Job={VRAM_PER_JOB_GB}GB, SafetyHeadroom={SAFETY_BUFFER_GB}GB")
 print("=" * 60)
 
 # ============================================================================ #
@@ -301,8 +305,26 @@ async def handler(event: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def concurrency_controller(current_concurrency: int) -> int:
-    """Controls dynamic/static concurrency per worker."""
-    return MAX_CONCURRENCY
+    """
+    Dynamically adjusts allowed concurrency based on real-time free VRAM.
+    If GPU query fails or CUDA is unavailable, gracefully falls back to DEFAULT_FALLBACK_CONCURRENCY.
+    """
+    try:
+        if not torch.cuda.is_available():
+            return DEFAULT_FALLBACK_CONCURRENCY
+
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device=0)
+        free_gb = free_bytes / (1024 ** 3)
+
+        usable_vram = max(0.0, free_gb - SAFETY_BUFFER_GB)
+        extra_slots = int(usable_vram // VRAM_PER_JOB_GB)
+        target = current_concurrency + extra_slots
+
+        # Clamp safely between min 1 and MAX_CONCURRENCY_CAP
+        return max(1, min(target, MAX_CONCURRENCY_CAP))
+    except Exception as exc:
+        print(f"⚠️ Failed to calculate dynamic VRAM concurrency ({exc}), fallback to {DEFAULT_FALLBACK_CONCURRENCY}")
+        return DEFAULT_FALLBACK_CONCURRENCY
 
 
 if __name__ == "__main__":
