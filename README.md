@@ -79,6 +79,10 @@ Achieves world-leading Signal-to-Distortion Ratio (**SDR 12.97 dB**) for pure, b
 
 ## 🛠️ Environment Variables
 
+- `FOUR_STEM_ENGINE`: Multi-stem separation engine: `"roformer"` (default) or `"demucs"`.
+- `FOUR_STEM_ROFORMER_MODEL`: SOTA RoFormer model for multi-stem separation (defaults to `BS-Roformer-SW.ckpt`).
+- `FOUR_STEM_DEMUCS_MODEL`: Demucs model for 4-stem separation (defaults to `htdemucs_ft.yaml`).
+- `DEFAULT_MODEL`: Default 2-stem model checkpoint filename (defaults to `model_bs_roformer_ep_317_sdr_12.9755.ckpt`).
+- `MAX_CONCURRENCY`: Worker job queue concurrency (defaults to `1` for sequential, crash-free execution).
 - `CATBOX_KEY`: Default Catbox userhash (optional).
-- `DEFAULT_MODEL`: Default model checkpoint filename (defaults to `model_bs_roformer_ep_317_sdr_12.9755.ckpt`).
 - `MODEL_DIR`: Directory where pre-baked weights reside (defaults to `/app/models`).

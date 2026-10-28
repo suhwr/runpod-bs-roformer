@@ -20,17 +20,33 @@ DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "model_bs_roformer_ep_317_sdr_12
 DEFAULT_CATBOX_USER_HASH = os.environ.get("CATBOX_KEY", "")
 MAX_CONCURRENCY = max(1, int(os.environ.get("MAX_CONCURRENCY", "1")))
 
+# 4-Stem / Multi-Stem Engine Configuration
+# FOUR_STEM_ENGINE: "roformer" (default) or "demucs"
+raw_engine_env = os.environ.get("FOUR_STEM_ENGINE", os.environ.get("FOUR_STEM_MODEL", "roformer")).strip()
+if raw_engine_env.lower() in ["roformer", "demucs"]:
+    FOUR_STEM_ENGINE = raw_engine_env.lower()
+elif "demucs" in raw_engine_env.lower():
+    FOUR_STEM_ENGINE = "demucs"
+elif "roformer" in raw_engine_env.lower():
+    FOUR_STEM_ENGINE = "roformer"
+else:
+    FOUR_STEM_ENGINE = "roformer"
+
+FOUR_STEM_ROFORMER_MODEL = os.environ.get("FOUR_STEM_ROFORMER_MODEL", "BS-Roformer-SW.ckpt")
+FOUR_STEM_DEMUCS_MODEL = os.environ.get("FOUR_STEM_DEMUCS_MODEL", "htdemucs_ft.yaml")
+
 pathlib.Path(MODEL_DIR).mkdir(parents=True, exist_ok=True)
 
 print("=" * 60)
-print(f"🚀 Initializing BS-RoFormer Serverless Worker (Max Concurrency: {MAX_CONCURRENCY})")
+print(f"🚀 Initializing Serverless Audio Separator Worker (Max Concurrency: {MAX_CONCURRENCY})")
 print(f"📦 PyTorch Version   : {torch.__version__}")
 print(f"⚡ CUDA Available    : {torch.cuda.is_available()}")
 if torch.cuda.is_available():
     print(f"🎮 GPU Device        : {torch.cuda.get_device_name(0)}")
     print(f"🧠 Total VRAM        : {torch.cuda.get_device_properties(0).total_memory / (1024**3):.2f} GB")
 print(f"📂 Model Directory   : {MODEL_DIR}")
-print(f"🎯 Default Model     : {DEFAULT_MODEL}")
+print(f"🎯 Default 2-Stem    : {DEFAULT_MODEL}")
+print(f"🎛️ 4-Stem Engine     : {FOUR_STEM_ENGINE} (roformer: {FOUR_STEM_ROFORMER_MODEL}, demucs: {FOUR_STEM_DEMUCS_MODEL})")
 print("=" * 60)
 
 # ============================================================================ #
@@ -170,7 +186,35 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     if not audio_url:
         return {"status": "FAILED", "error": "audio_url is required"}
 
-    model_name = job_input.get("model_name", DEFAULT_MODEL)
+    raw_model_name = str(job_input.get("model_name", "")).strip()
+    is_4stem = bool(job_input.get("is_4stem", False))
+    force_model = bool(job_input.get("force_model", False))
+
+    # Allow runtime engine override per job, otherwise use FOUR_STEM_ENGINE env
+    job_engine = str(job_input.get("four_stem_engine", "")).strip().lower()
+    active_engine = job_engine if job_engine in ["roformer", "demucs"] else FOUR_STEM_ENGINE
+
+    # Check if 4-stem / multi-stem separation is requested
+    is_multi_request = (
+        is_4stem or
+        raw_model_name.lower() in [
+            "4stems", "4stem", "4", "all", "multi", "multistem",
+            "htdemucs_ft.yaml", "htdemucs.yaml", "bs-roformer-sw.ckpt"
+        ]
+    )
+
+    if is_multi_request:
+        if force_model and raw_model_name:
+            model_name = raw_model_name
+        elif active_engine == "demucs":
+            model_name = FOUR_STEM_DEMUCS_MODEL
+        else:
+            model_name = FOUR_STEM_ROFORMER_MODEL
+        print(f"[{job_id}] 🎛️ 4-Stem requested. Selected engine: '{active_engine}' -> model: '{model_name}'")
+    elif raw_model_name:
+        model_name = raw_model_name
+    else:
+        model_name = DEFAULT_MODEL
     output_format = job_input.get("output_format", "MP3").upper()
     if output_format not in ["MP3", "WAV", "FLAC"]:
         output_format = "MP3"
@@ -266,7 +310,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         stems_dict: Dict[str, Dict[str, Any]] = {}
         for file_path in found_stem_files:
             file_lower = file_path.name.lower()
-            if "vocals" in file_lower:
+            if "vocals" in file_lower or "vocal" in file_lower:
                 stem_key = "vocals"
             elif "instrumental" in file_lower or "instrument" in file_lower:
                 stem_key = "instrumental"
@@ -274,7 +318,11 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
                 stem_key = "drums"
             elif "bass" in file_lower:
                 stem_key = "bass"
-            elif "other" in file_lower:
+            elif "guitar" in file_lower:
+                stem_key = "guitar"
+            elif "piano" in file_lower:
+                stem_key = "piano"
+            elif "other" in file_lower or "melody" in file_lower or "melodi" in file_lower:
                 stem_key = "other"
             else:
                 stem_key = file_path.stem

@@ -49,10 +49,13 @@ RUN python3 -m pip install --no-cache-dir \
     --extra-index-url https://download.pytorch.org/whl/cu124 \
     -r /app/requirements.txt
 
-# 4. Pre-download SOTA BS-RoFormer ViperX 12.97 SDR model into image layer
+# 4. Pre-download SOTA BS-RoFormer models into image layer
 # Baking models directly eliminates cold-start model downloads at runtime (Zero Cold-Start!)
 RUN mkdir -p /app/models && \
-    python3 -c "from audio_separator.separator import Separator; s = Separator(model_file_dir='/app/models'); s.load_model('model_bs_roformer_ep_317_sdr_12.9755.ckpt')"
+    python3 -c "from audio_separator.separator import Separator; s = Separator(model_file_dir='/app/models'); s.load_model('model_bs_roformer_ep_317_sdr_12.9755.ckpt'); s.load_model('BS-Roformer-SW.ckpt')"
+
+# Default multi-stem engine: roformer (or set to demucs via environment)
+ENV FOUR_STEM_ENGINE=roformer
 
 # 5. Copy handler and assets
 COPY handler.py /app/handler.py
