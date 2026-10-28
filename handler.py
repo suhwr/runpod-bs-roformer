@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import os
 import pathlib
@@ -16,22 +17,22 @@ from audio_separator.separator import Separator
 # ============================================================================ #
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "/app/models")
-OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/tmp/output")
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "model_bs_roformer_ep_317_sdr_12.9755.ckpt")
 DEFAULT_CATBOX_USER_HASH = os.environ.get("CATBOX_KEY", "")
+MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "2"))
 
 pathlib.Path(MODEL_DIR).mkdir(parents=True, exist_ok=True)
-pathlib.Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
 print("=" * 60)
-print("🚀 Initializing BS-RoFormer Serverless Worker")
-print(f"📦 PyTorch Version : {torch.__version__}")
-print(f"⚡ CUDA Available  : {torch.cuda.is_available()}")
+print("🚀 Initializing BS-RoFormer Serverless Worker (Concurrent-Ready)")
+print(f"📦 PyTorch Version   : {torch.__version__}")
+print(f"⚡ CUDA Available    : {torch.cuda.is_available()}")
 if torch.cuda.is_available():
-    print(f"🎮 GPU Device      : {torch.cuda.get_device_name(0)}")
-    print(f"🧠 Total VRAM      : {torch.cuda.get_device_properties(0).total_memory / (1024**3):.2f} GB")
-print(f"📂 Model Directory : {MODEL_DIR}")
-print(f"🎯 Default Model   : {DEFAULT_MODEL}")
+    print(f"🎮 GPU Device        : {torch.cuda.get_device_name(0)}")
+    print(f"🧠 Total VRAM        : {torch.cuda.get_device_properties(0).total_memory / (1024**3):.2f} GB")
+print(f"📂 Model Directory   : {MODEL_DIR}")
+print(f"🎯 Default Model     : {DEFAULT_MODEL}")
+print(f"🔀 Max Concurrency   : {MAX_CONCURRENCY} concurrent jobs per worker")
 print("=" * 60)
 
 # ============================================================================ #
@@ -40,13 +41,15 @@ print("=" * 60)
 
 separator = Separator(
     model_file_dir=MODEL_DIR,
-    output_dir=OUTPUT_DIR,
+    output_dir="/tmp",
     output_format="MP3",
     output_bitrate="320k",
-    use_autocast=True,  # FP16 (Half-Precision) optimization for maximum speed & lower VRAM
+    use_autocast=True,  # FP16 (Half-Precision) optimization
 )
 
 CURRENT_LOADED_MODEL: Optional[str] = None
+# Async lock to ensure thread safety on GPU and audio-separator instance
+gpu_lock = asyncio.Lock()
 
 try:
     print(f"⏳ Pre-loading default model: {DEFAULT_MODEL}...")
@@ -147,14 +150,24 @@ def upload_with_fallback(file_path: pathlib.Path, catbox_hash: Optional[str] = N
     raise RuntimeError("All uploaders failed: " + " | ".join(errors))
 
 
+def _download_file(url: str, dest_path: pathlib.Path) -> None:
+    resp = requests.get(url, stream=True, timeout=120)
+    resp.raise_for_status()
+    with open(dest_path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                f.write(chunk)
+
+
 # ============================================================================ #
-# Serverless Handler Function                                                  #
+# Asynchronous Serverless Handler Function with GPU Serialization              #
 # ============================================================================ #
 
-def handler(event: Dict[str, Any]) -> Dict[str, Any]:
+async def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     global CURRENT_LOADED_MODEL
 
     start_time = time.time()
+    job_id = event.get("id", f"job_{int(start_time * 1000)}")
     job_input = event.get("input", {})
 
     audio_url = job_input.get("audio_url")
@@ -170,48 +183,52 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     single_stem = job_input.get("single_stem")  # e.g., "Vocals" or "Instrumental"
     catbox_key = job_input.get("catbox_key", DEFAULT_CATBOX_USER_HASH)
 
-    temp_dir = tempfile.mkdtemp()
-    temp_dir_path = pathlib.Path(temp_dir)
-    input_path = temp_dir_path / "input_audio.mp3"
+    # Create isolated job workspace to prevent any file collision
+    job_temp_dir = pathlib.Path(tempfile.mkdtemp(prefix=f"sep_{job_id}_"))
+    job_output_dir = job_temp_dir / "output"
+    job_output_dir.mkdir(parents=True, exist_ok=True)
+    input_path = job_temp_dir / "input_audio.mp3"
+
+    loop = asyncio.get_running_loop()
 
     try:
-        # 1. Download input audio with stream
-        print(f"📥 Downloading audio from: {audio_url}")
-        resp = requests.get(audio_url, stream=True, timeout=120)
-        resp.raise_for_status()
-        with open(input_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-        print(f"💾 Saved input audio ({input_path.stat().st_size} bytes)")
+        # 1. Download input audio (I/O bound, runs non-blocking)
+        print(f"[{job_id}] 📥 Downloading audio from: {audio_url}")
+        await loop.run_in_executor(None, _download_file, audio_url, input_path)
+        print(f"[{job_id}] 💾 Saved input audio ({input_path.stat().st_size} bytes)")
 
-        # 2. Dynamic model switching if requested model is different
-        if model_name != CURRENT_LOADED_MODEL:
-            print(f"🔄 Switching model from {CURRENT_LOADED_MODEL} -> {model_name}...")
-            separator.load_model(model_filename=model_name)
-            CURRENT_LOADED_MODEL = model_name
+        # 2. Acquire GPU Lock for Separation & Model Switching
+        # Ensures 100% thread safety for PyTorch/CUDA and audio-separator instance
+        async with gpu_lock:
+            # Dynamic model switching if requested model is different
+            if model_name != CURRENT_LOADED_MODEL:
+                print(f"[{job_id}] 🔄 Switching model from {CURRENT_LOADED_MODEL} -> {model_name}...")
+                await loop.run_in_executor(None, separator.load_model, model_name)
+                CURRENT_LOADED_MODEL = model_name
 
-        # 3. Configure separator options
-        separator.output_format = output_format
-        separator.output_bitrate = bitrate
-        separator.output_single_stem = single_stem if single_stem in ["Vocals", "Instrumental"] else None
+            # Configure separator options for this specific job
+            separator.output_dir = str(job_output_dir)
+            separator.output_format = output_format
+            separator.output_bitrate = bitrate
+            separator.output_single_stem = single_stem if single_stem in ["Vocals", "Instrumental"] else None
 
-        # 4. Run separation
-        print(f"⚙️ Running separation using {CURRENT_LOADED_MODEL} (autocast=FP16)...")
-        sep_start = time.time()
-        output_files = separator.separate(str(input_path))
-        sep_elapsed = time.time() - sep_start
-        print(f"✅ Separation completed in {sep_elapsed:.2f}s! Stems produced: {output_files}")
+            # Run GPU separation
+            print(f"[{job_id}] ⚙️ Running GPU separation using {CURRENT_LOADED_MODEL} (autocast=FP16)...")
+            sep_start = time.time()
+            output_files = await loop.run_in_executor(None, separator.separate, str(input_path))
+            sep_elapsed = time.time() - sep_start
+            print(f"[{job_id}] ✅ GPU separation completed in {sep_elapsed:.2f}s! Stems produced: {output_files}")
 
-        # 5. Process stems & upload via fallback chain
+        # GPU is now freed immediately for the next queued job!
+        # 3. Process stems & upload via fallback chain (I/O bound, runs non-blocking)
         stems_dict: Dict[str, Dict[str, Any]] = {}
         for file_item in output_files:
-            file_path = pathlib.Path(OUTPUT_DIR) / file_item
+            file_path = job_output_dir / file_item
             if not file_path.exists():
                 file_path = pathlib.Path(file_item)
 
             if not file_path.exists():
-                print(f"⚠️ Output file not found: {file_item}")
+                print(f"[{job_id}] ⚠️ Output file not found: {file_item}")
                 continue
 
             file_lower = file_path.name.lower()
@@ -229,17 +246,19 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
                 stem_key = file_path.stem
 
             file_size = file_path.stat().st_size
-            print(f"⬆️ Uploading stem '{stem_key}' ({file_size} bytes)...")
+            print(f"[{job_id}] ⬆️ Uploading stem '{stem_key}' ({file_size} bytes)...")
 
             try:
-                url, storage = upload_with_fallback(file_path, catbox_hash=catbox_key)
+                url, storage = await loop.run_in_executor(
+                    None, upload_with_fallback, file_path, catbox_key
+                )
                 stems_dict[stem_key] = {
                     "url": url,
                     "file_name": file_path.name,
                     "size_bytes": file_size,
                     "storage": storage,
                 }
-                print(f"✨ Stem '{stem_key}' uploaded to {storage}: {url}")
+                print(f"[{job_id}] ✨ Stem '{stem_key}' uploaded to {storage}: {url}")
             except Exception as up_err:
                 # Fallback to base64 only if file is small enough (<7MB)
                 if file_size < 7 * 1024 * 1024:
@@ -251,19 +270,13 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
                         "size_bytes": file_size,
                         "storage": "base64",
                     }
-                    print(f"⚠️ Upload failed ({up_err}), fallback to base64 for '{stem_key}'")
+                    print(f"[{job_id}] ⚠️ Upload failed ({up_err}), fallback to base64 for '{stem_key}'")
                 else:
                     stems_dict[stem_key] = {
                         "error": str(up_err),
                         "file_name": file_path.name,
                         "size_bytes": file_size,
                     }
-
-            # Unlink output file locally immediately to keep container disk clean
-            try:
-                file_path.unlink()
-            except Exception:
-                pass
 
         total_elapsed = time.time() - start_time
         return {
@@ -275,17 +288,25 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     except Exception as exc:
-        print(f"❌ Error during separation: {exc}")
+        print(f"[{job_id}] ❌ Error during separation: {exc}")
         return {
             "status": "FAILED",
             "error": f"Separation failed: {str(exc)}",
         }
 
     finally:
-        # Clean up temporary input folder
-        if temp_dir_path.exists():
-            shutil.rmtree(temp_dir_path, ignore_errors=True)
+        # Clean up temporary job folder completely
+        if job_temp_dir.exists():
+            shutil.rmtree(job_temp_dir, ignore_errors=True)
+
+
+def concurrency_controller(current_concurrency: int) -> int:
+    """Controls dynamic/static concurrency per worker."""
+    return MAX_CONCURRENCY
 
 
 if __name__ == "__main__":
-    runpod.serverless.start({"handler": handler})
+    runpod.serverless.start({
+        "handler": handler,
+        "concurrency_modifier": concurrency_controller,
+    })
