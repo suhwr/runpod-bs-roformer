@@ -1,4 +1,3 @@
-import asyncio
 import base64
 import os
 import pathlib
@@ -19,15 +18,11 @@ from audio_separator.separator import Separator
 MODEL_DIR = os.environ.get("MODEL_DIR", "/app/models")
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "model_bs_roformer_ep_317_sdr_12.9755.ckpt")
 DEFAULT_CATBOX_USER_HASH = os.environ.get("CATBOX_KEY", "")
-DEFAULT_FALLBACK_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "3"))
-MAX_CONCURRENCY_CAP = int(os.environ.get("MAX_CONCURRENCY_CAP", "6"))
-VRAM_PER_JOB_GB = float(os.environ.get("VRAM_PER_JOB_GB", "2.5"))
-SAFETY_BUFFER_GB = float(os.environ.get("SAFETY_BUFFER_GB", "2.0"))
 
 pathlib.Path(MODEL_DIR).mkdir(parents=True, exist_ok=True)
 
 print("=" * 60)
-print("🚀 Initializing BS-RoFormer Serverless Worker (Dynamic VRAM Concurrency)")
+print("🚀 Initializing BS-RoFormer Serverless Worker (Sequential Queue, Concurrency=1)")
 print(f"📦 PyTorch Version   : {torch.__version__}")
 print(f"⚡ CUDA Available    : {torch.cuda.is_available()}")
 if torch.cuda.is_available():
@@ -35,8 +30,6 @@ if torch.cuda.is_available():
     print(f"🧠 Total VRAM        : {torch.cuda.get_device_properties(0).total_memory / (1024**3):.2f} GB")
 print(f"📂 Model Directory   : {MODEL_DIR}")
 print(f"🎯 Default Model     : {DEFAULT_MODEL}")
-print(f"🔀 Fallback Concurr  : {DEFAULT_FALLBACK_CONCURRENCY} (Max Cap: {MAX_CONCURRENCY_CAP})")
-print(f"⚖️ VRAM Buffer Rules : Job={VRAM_PER_JOB_GB}GB, SafetyHeadroom={SAFETY_BUFFER_GB}GB")
 print("=" * 60)
 
 # ============================================================================ #
@@ -52,8 +45,6 @@ separator = Separator(
 )
 
 CURRENT_LOADED_MODEL: Optional[str] = None
-# Async lock to ensure thread safety on GPU and audio-separator instance
-gpu_lock = asyncio.Lock()
 
 try:
     print(f"⏳ Pre-loading default model: {DEFAULT_MODEL}...")
@@ -164,10 +155,10 @@ def _download_file(url: str, dest_path: pathlib.Path) -> None:
 
 
 # ============================================================================ #
-# Asynchronous Serverless Handler Function with GPU Serialization              #
+# Serverless Handler Function (Sequential Execution, Concurrency=1)            #
 # ============================================================================ #
 
-async def handler(event: Dict[str, Any]) -> Dict[str, Any]:
+def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     global CURRENT_LOADED_MODEL
 
     start_time = time.time()
@@ -193,48 +184,86 @@ async def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     job_output_dir.mkdir(parents=True, exist_ok=True)
     input_path = job_temp_dir / "input_audio.mp3"
 
-    loop = asyncio.get_running_loop()
-
     try:
-        # 1. Download input audio (I/O bound, runs non-blocking)
+        # 1. Download input audio
         print(f"[{job_id}] 📥 Downloading audio from: {audio_url}")
-        await loop.run_in_executor(None, _download_file, audio_url, input_path)
+        _download_file(audio_url, input_path)
         print(f"[{job_id}] 💾 Saved input audio ({input_path.stat().st_size} bytes)")
 
-        # 2. Acquire GPU Lock for Separation & Model Switching
-        # Ensures 100% thread safety for PyTorch/CUDA and audio-separator instance
-        async with gpu_lock:
-            # Dynamic model switching if requested model is different
-            if model_name != CURRENT_LOADED_MODEL:
-                print(f"[{job_id}] 🔄 Switching model from {CURRENT_LOADED_MODEL} -> {model_name}...")
-                await loop.run_in_executor(None, separator.load_model, model_name)
-                CURRENT_LOADED_MODEL = model_name
+        # 2. Dynamic model switching if requested model is different
+        if model_name != CURRENT_LOADED_MODEL:
+            print(f"[{job_id}] 🔄 Switching model from {CURRENT_LOADED_MODEL} -> {model_name}...")
+            separator.load_model(model_filename=model_name)
+            CURRENT_LOADED_MODEL = model_name
 
-            # Configure separator options for this specific job
-            separator.output_dir = str(job_output_dir)
-            separator.output_format = output_format
-            separator.output_bitrate = bitrate
-            separator.output_single_stem = single_stem if single_stem in ["Vocals", "Instrumental"] else None
+        # Configure separator options for this specific job
+        separator.output_dir = str(job_output_dir)
+        separator.output_format = output_format
+        separator.output_bitrate = bitrate
+        separator.output_single_stem = single_stem if single_stem in ["Vocals", "Instrumental"] else None
 
-            # Run GPU separation
-            print(f"[{job_id}] ⚙️ Running GPU separation using {CURRENT_LOADED_MODEL} (autocast=FP16)...")
-            sep_start = time.time()
-            output_files = await loop.run_in_executor(None, separator.separate, str(input_path))
-            sep_elapsed = time.time() - sep_start
-            print(f"[{job_id}] ✅ GPU separation completed in {sep_elapsed:.2f}s! Stems produced: {output_files}")
+        # Synchronize output_dir to the underlying model instance if present
+        if hasattr(separator, "model_instance") and separator.model_instance:
+            separator.model_instance.output_dir = str(job_output_dir)
+            if hasattr(separator.model_instance, "output_format"):
+                separator.model_instance.output_format = output_format
 
-        # GPU is now freed immediately for the next queued job!
-        # 3. Process stems & upload via fallback chain (I/O bound, runs non-blocking)
+        # Run GPU separation
+        print(f"[{job_id}] ⚙️ Running GPU separation using {CURRENT_LOADED_MODEL} (autocast=FP16)...")
+        sep_start = time.time()
+        output_files = separator.separate(str(input_path))
+        sep_elapsed = time.time() - sep_start
+        print(f"[{job_id}] ✅ GPU separation completed in {sep_elapsed:.2f}s! Stems produced: {output_files}")
+
+        # 3. Resolve stem files across multiple candidate locations
+        found_stem_files: List[pathlib.Path] = []
+        if output_files:
+            for file_item in output_files:
+                p = pathlib.Path(file_item)
+                candidates = [
+                    job_output_dir / p.name,
+                    p,
+                    pathlib.Path("/tmp") / p.name,
+                    pathlib.Path("/app") / p.name,
+                ]
+                for cand in candidates:
+                    if cand.exists() and cand.is_file() and cand.stat().st_size > 0:
+                        target = job_output_dir / cand.name
+                        if cand.resolve() != target.resolve():
+                            try:
+                                shutil.copy2(cand, target)
+                                cand = target
+                            except Exception:
+                                pass
+                        found_stem_files.append(cand)
+                        break
+
+        # Fallback filesystem scanning if output_files list resolution didn't locate files
+        if not found_stem_files:
+            print(f"[{job_id}] 🔍 Scanning {job_output_dir} for output stems...")
+            for ext in ("*.mp3", "*.wav", "*.flac"):
+                found_stem_files.extend(job_output_dir.glob(ext))
+
+        # Check /tmp fallback scan if still empty
+        if not found_stem_files:
+            print(f"[{job_id}] 🔍 Fallback scanning /tmp for recently generated stems...")
+            for ext in ("*.mp3", "*.wav", "*.flac"):
+                for tmp_file in pathlib.Path("/tmp").glob(ext):
+                    # Check files modified in the last 2 minutes
+                    if time.time() - tmp_file.stat().st_mtime < 120 and tmp_file.stat().st_size > 0:
+                        target = job_output_dir / tmp_file.name
+                        shutil.copy2(tmp_file, target)
+                        found_stem_files.append(target)
+
+        if not found_stem_files:
+            return {
+                "status": "FAILED",
+                "error": "No stems were generated by the separation engine.",
+            }
+
+        # 4. Upload stems via fallback chain
         stems_dict: Dict[str, Dict[str, Any]] = {}
-        for file_item in output_files:
-            file_path = job_output_dir / file_item
-            if not file_path.exists():
-                file_path = pathlib.Path(file_item)
-
-            if not file_path.exists():
-                print(f"[{job_id}] ⚠️ Output file not found: {file_item}")
-                continue
-
+        for file_path in found_stem_files:
             file_lower = file_path.name.lower()
             if "vocals" in file_lower:
                 stem_key = "vocals"
@@ -253,9 +282,7 @@ async def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             print(f"[{job_id}] ⬆️ Uploading stem '{stem_key}' ({file_size} bytes)...")
 
             try:
-                url, storage = await loop.run_in_executor(
-                    None, upload_with_fallback, file_path, catbox_key
-                )
+                url, storage = upload_with_fallback(file_path, catbox_key)
                 stems_dict[stem_key] = {
                     "url": url,
                     "file_name": file_path.name,
@@ -264,23 +291,31 @@ async def handler(event: Dict[str, Any]) -> Dict[str, Any]:
                 }
                 print(f"[{job_id}] ✨ Stem '{stem_key}' uploaded to {storage}: {url}")
             except Exception as up_err:
-                # Fallback to base64 only if file is small enough (<7MB)
-                if file_size < 7 * 1024 * 1024:
+                print(f"[{job_id}] ⚠️ Upload failed ({up_err}) for '{stem_key}'")
+                # Fallback to base64 if small enough (<10MB)
+                if file_size < 10 * 1024 * 1024:
                     with open(file_path, "rb") as bf:
                         b64_data = base64.b64encode(bf.read()).decode("utf-8")
                     stems_dict[stem_key] = {
+                        "url": "",
                         "base64": b64_data,
                         "file_name": file_path.name,
                         "size_bytes": file_size,
                         "storage": "base64",
                     }
-                    print(f"[{job_id}] ⚠️ Upload failed ({up_err}), fallback to base64 for '{stem_key}'")
+                    print(f"[{job_id}] ⚠️ Base64 fallback active for '{stem_key}'")
                 else:
                     stems_dict[stem_key] = {
                         "error": str(up_err),
                         "file_name": file_path.name,
                         "size_bytes": file_size,
                     }
+
+        if not stems_dict or all("url" not in v and "base64" not in v for v in stems_dict.values()):
+            return {
+                "status": "FAILED",
+                "error": "Failed to upload separated stems to storage.",
+            }
 
         total_elapsed = time.time() - start_time
         return {
@@ -302,62 +337,12 @@ async def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         # Clean up temporary job folder completely
         if job_temp_dir.exists():
             shutil.rmtree(job_temp_dir, ignore_errors=True)
-
-
-def get_real_free_vram_gb(device: int = 0) -> Tuple[float, float]:
-    """
-    Returns (usable_free_gb, total_gb).
-    Combines driver-level unallocated memory and PyTorch internal reusable cache
-    (reserved - allocated) to prevent under-reporting available VRAM due to the caching allocator.
-    """
-    driver_free_bytes, total_bytes = torch.cuda.mem_get_info(device=device)
-    allocated_bytes = torch.cuda.memory_allocated(device=device)
-    reserved_bytes = torch.cuda.memory_reserved(device=device)
-    reusable_cached = max(0, reserved_bytes - allocated_bytes)
-    true_free_bytes = driver_free_bytes + reusable_cached
-    return true_free_bytes / (1024 ** 3), total_bytes / (1024 ** 3)
-
-
-def concurrency_controller(current_concurrency: int) -> int:
-    """
-    Dynamically adjusts allowed concurrency based on real-time hardware VRAM.
-    Adapts max ceiling according to installed GPU memory size:
-      - <=8.5 GB  (e.g., T4, RTX 3070)      : cap 1
-      - <=16.5 GB (e.g., RTX 4000 Ada, A4000) : cap 3
-      - <=24.5 GB (e.g., RTX 3090, RTX 4090)  : cap 4
-      - >24.5 GB  (e.g., A100, H100)          : cap 8
-    Falls back gracefully to DEFAULT_FALLBACK_CONCURRENCY on any measurement anomaly.
-    """
-    try:
-        if not torch.cuda.is_available():
-            return DEFAULT_FALLBACK_CONCURRENCY
-
-        true_free_gb, total_gb = get_real_free_vram_gb(device=0)
-
-        # Hardware-adaptive ceiling based on total GPU capacity
-        if total_gb <= 8.5:
-            hw_cap = 1
-        elif total_gb <= 16.5:
-            hw_cap = 3
-        elif total_gb <= 24.5:
-            hw_cap = 4
-        else:
-            hw_cap = 8
-
-        effective_cap = min(MAX_CONCURRENCY_CAP, hw_cap)
-
-        usable_vram = max(0.0, true_free_gb - SAFETY_BUFFER_GB)
-        extra_slots = int(usable_vram // VRAM_PER_JOB_GB)
-        target = current_concurrency + extra_slots
-
-        return max(1, min(target, effective_cap))
-    except Exception as exc:
-        print(f"⚠️ Failed to calculate dynamic VRAM concurrency ({exc}), fallback to {DEFAULT_FALLBACK_CONCURRENCY}")
-        return DEFAULT_FALLBACK_CONCURRENCY
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
+    print("🚀 Starting Serverless Worker (Sequential Queue, Concurrency=1)...")
     runpod.serverless.start({
         "handler": handler,
-        "concurrency_modifier": concurrency_controller,
     })
