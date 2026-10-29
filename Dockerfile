@@ -61,4 +61,6 @@ ENV FOUR_STEM_ENGINE=roformer
 COPY handler.py /app/handler.py
 COPY README.md /app/README.md
 
+RUN python3 -m compileall -q /app
+
 CMD ["python3", "-u", "/app/handler.py"]
