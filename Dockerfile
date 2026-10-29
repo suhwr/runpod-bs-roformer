@@ -7,6 +7,9 @@ FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=0 \
+    CUDA_MODULE_LOADING=LAZY \
+    LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
     PIP_PREFER_BINARY=1 \
     TORCHAUDIO_USE_SOUND_FILE=1 \
     TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0"
@@ -22,6 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libsndfile1 \
     libsndfile1-dev \
+    libjemalloc2 \
     build-essential \
     curl \
     git \
@@ -61,6 +65,6 @@ ENV FOUR_STEM_ENGINE=roformer
 COPY handler.py /app/handler.py
 COPY README.md /app/README.md
 
-RUN python3 -m compileall -q /app
+RUN python3 -m compileall -q /app /usr/local/lib/python3.11/dist-packages || true
 
 CMD ["python3", "-u", "/app/handler.py"]

@@ -1,4 +1,10 @@
 import base64
+import os
+
+os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
+os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "0")
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
+
 import hashlib
 import mimetypes
 import os
@@ -349,7 +355,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     if output_format not in ["MP3", "WAV", "FLAC"]:
         output_format = "MP3"
 
-    bitrate = str(job_input.get("bitrate", "320k"))
+    bitrate = str(job_input.get("bitrate", "192k"))
     single_stem = job_input.get("single_stem")  # e.g., "Vocals" or "Instrumental"
     catbox_key = job_input.get("catbox_key", DEFAULT_CATBOX_USER_HASH)
 
