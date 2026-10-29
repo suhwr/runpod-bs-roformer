@@ -390,7 +390,8 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         separator.output_dir = str(job_output_dir)
         separator.output_format = output_format
         separator.output_bitrate = bitrate
-        separator.output_single_stem = single_stem if single_stem in ["Vocals", "Instrumental"] else None
+        single_stem_cap = str(single_stem).strip().capitalize() if single_stem else ""
+        separator.output_single_stem = single_stem_cap if single_stem_cap in ["Vocals", "Instrumental"] else None
 
         # Synchronize output_dir to the underlying model instance if present
         if hasattr(separator, "model_instance") and separator.model_instance:
@@ -455,14 +456,22 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         stems_dict: Dict[str, Dict[str, Any]] = {}
         for file_path in found_stem_files:
             file_lower = file_path.name.lower()
-            if "vocals" in file_lower or "vocal" in file_lower:
+            if "lead" in file_lower and "vocal" in file_lower:
+                stem_key = "lead_vocals"
+            elif "back" in file_lower and "vocal" in file_lower:
+                stem_key = "backing_vocals"
+            elif "vocal" in file_lower:
                 stem_key = "vocals"
-            elif "instrumental" in file_lower or "instrument" in file_lower:
+            elif "instrument" in file_lower:
                 stem_key = "instrumental"
-            elif "drums" in file_lower or "drum" in file_lower:
+            elif "drum" in file_lower:
                 stem_key = "drums"
             elif "bass" in file_lower:
                 stem_key = "bass"
+            elif "electric_guitar" in file_lower:
+                stem_key = "electric_guitar"
+            elif "acoustic_guitar" in file_lower:
+                stem_key = "acoustic_guitar"
             elif "guitar" in file_lower:
                 stem_key = "guitar"
             elif "piano" in file_lower:
@@ -470,7 +479,15 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             elif "other" in file_lower or "melody" in file_lower or "melodi" in file_lower:
                 stem_key = "other"
             else:
-                stem_key = file_path.stem
+                cleaned = file_path.stem
+                if "(" in cleaned and ")" in cleaned:
+                    cleaned = cleaned.split("(")[-1].split(")")[0]
+                elif "_" in cleaned:
+                    cleaned = cleaned.split("_")[-1]
+                stem_key = cleaned.strip().lower() or file_path.stem.lower()
+
+            if stem_key in stems_dict:
+                stem_key = f"{stem_key}_{file_path.stem.lower()}"
 
             file_size = file_path.stat().st_size
             print(f"[{job_id}] ⬆️ Uploading stem '{stem_key}' ({file_size} bytes)...")
