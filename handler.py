@@ -1,8 +1,6 @@
 import base64
 import os
 
-os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
-os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "0")
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
 import hashlib
@@ -21,6 +19,46 @@ import requests
 import runpod
 import torch
 from audio_separator.separator import Separator
+
+# ============================================================================ #
+# High-Performance Patches for Audio Export & Duration Probing                #
+# ============================================================================ #
+try:
+    import librosa
+    import soundfile as sf
+    _orig_get_duration = getattr(librosa, "get_duration", None)
+
+    def _fast_get_duration(*args, **kwargs):
+        # Header-only duration probe to avoid full-file decoding across 40MB+ WAV
+        path = kwargs.get("path") or (args[0] if args and isinstance(args[0], (str, pathlib.Path)) else None)
+        if path:
+            try:
+                info = sf.info(str(path))
+                return float(info.duration)
+            except Exception:
+                pass
+        if _orig_get_duration:
+            return _orig_get_duration(*args, **kwargs)
+        return 0.0
+
+    librosa.get_duration = _fast_get_duration
+except Exception:
+    pass
+
+try:
+    from pydub import AudioSegment
+    _orig_export = AudioSegment.export
+
+    def _fast_export(self, out_f, format=None, codec=None, bitrate=None, parameters=None, tags=None, id3v2_version="4", cover=None):
+        # Enable multi-threaded FFmpeg encoding (-threads 0) for fast MP3 export
+        params = list(parameters) if parameters else []
+        if "-threads" not in params:
+            params.extend(["-threads", "0"])
+        return _orig_export(self, out_f, format=format, codec=codec, bitrate=bitrate, parameters=params, tags=tags, id3v2_version=id3v2_version, cover=cover)
+
+    AudioSegment.export = _fast_export
+except Exception:
+    pass
 
 # ============================================================================ #
 # Configuration & Hardware Diagnostics                                         #
@@ -79,6 +117,13 @@ try:
     separator.load_model(model_filename=DEFAULT_MODEL)
     CURRENT_LOADED_MODEL = DEFAULT_MODEL
     print(f"✅ Pre-loaded {DEFAULT_MODEL} successfully into VRAM!")
+
+    if torch.cuda.is_available():
+        torch.cuda.init()
+        _dummy = torch.zeros((1, 2, 44100), device="cuda", dtype=torch.float16)
+        del _dummy
+        torch.cuda.synchronize()
+        print("⚡ CUDA runtime & Tensor cores warmed up successfully!")
 except Exception as exc:
     print(f"⚠️ Warning during model pre-load: {exc}")
 
@@ -404,6 +449,8 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             separator.model_instance.output_dir = str(job_output_dir)
             if hasattr(separator.model_instance, "output_format"):
                 separator.model_instance.output_format = output_format
+            if hasattr(separator.model_instance, "output_bitrate"):
+                separator.model_instance.output_bitrate = bitrate
 
         # Run GPU separation
         print(f"[{job_id}] ⚙️ Running GPU separation using {CURRENT_LOADED_MODEL} (autocast=FP16)...")

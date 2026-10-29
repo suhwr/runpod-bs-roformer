@@ -7,12 +7,10 @@ FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=0 \
-    CUDA_MODULE_LOADING=LAZY \
-    LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
     PIP_PREFER_BINARY=1 \
     TORCHAUDIO_USE_SOUND_FILE=1 \
-    TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0"
+    TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0" \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
 
 # 1. Install system tools, ffmpeg, build packages, and Python 3.11
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -25,7 +23,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libsndfile1 \
     libsndfile1-dev \
-    libjemalloc2 \
     build-essential \
     curl \
     git \
