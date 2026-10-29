@@ -1,9 +1,14 @@
 import base64
+import hashlib
+import mimetypes
 import os
 import pathlib
 import shutil
+import subprocess
 import tempfile
 import time
+import urllib.parse
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -74,8 +79,122 @@ except Exception as exc:
 
 # ============================================================================ #
 # Storage Uploaders with Automatic Fallback Chain                              #
-# uguu.se -> catbox.moe -> ucarecdn.com -> base64 (fallback)                  #
+# Backblaze B2 (Primary) -> Uguu -> Catbox -> Uploadcare -> Base64             #
 # ============================================================================ #
+
+def _upload_b2(file_path: pathlib.Path, folder: str = "tmp/audio") -> str:
+    """
+    Upload audio stems to Backblaze B2 (boto3 S3 or native REST API).
+    Target prefix 'tmp/' allows automatic Lifecycle cleanup rules.
+    """
+    key_id = os.environ.get("B2_KEY_ID") or os.environ.get("AWS_ACCESS_KEY_ID")
+    app_key = os.environ.get("B2_APPLICATION_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY")
+    bucket = os.environ.get("B2_BUCKET_NAME")
+    endpoint = os.environ.get("B2_ENDPOINT_URL") or os.environ.get("AWS_ENDPOINT_URL")
+
+    if not (key_id and app_key and bucket):
+        raise ValueError("Backblaze B2 credentials (B2_KEY_ID, B2_APPLICATION_KEY, B2_BUCKET_NAME) not set")
+
+    clean_folder = folder.strip("/")
+    target_key = f"{clean_folder}/{int(time.time())}_{uuid.uuid4().hex[:8]}_{file_path.name}"
+    content_type, _ = mimetypes.guess_type(str(file_path))
+    if not content_type:
+        content_type = "audio/mpeg"
+
+    # Attempt 1: boto3 S3 API if endpoint is set
+    if endpoint:
+        try:
+            import boto3
+            from botocore.config import Config
+
+            s3 = boto3.client(
+                "s3",
+                endpoint_url=endpoint,
+                aws_access_key_id=key_id,
+                aws_secret_access_key=app_key,
+                config=Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
+            )
+            with open(file_path, "rb") as f:
+                s3.upload_fileobj(f, bucket, target_key, ExtraArgs={"ContentType": content_type})
+
+            public_prefix = os.environ.get("B2_PUBLIC_URL_PREFIX", "").rstrip("/")
+            if public_prefix:
+                return f"{public_prefix}/{target_key}"
+
+            try:
+                return s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": target_key}, ExpiresIn=86400)
+            except Exception:
+                parsed = urllib.parse.urlsplit(endpoint)
+                return f"{parsed.scheme}://{bucket}.{parsed.netloc}/{target_key}"
+        except ImportError:
+            pass
+
+    # Attempt 2: B2 Native REST API
+    auth_resp = requests.get(
+        "https://api.backblazeb2.com/b2api/v3/b2_authorize_account",
+        auth=(key_id, app_key),
+        timeout=30,
+    )
+    auth_resp.raise_for_status()
+    auth_data = auth_resp.json()
+    api_url = auth_data["apiUrl"]
+    auth_token = auth_data["authorizationToken"]
+    download_url = auth_data["downloadUrl"]
+
+    bucket_id = os.environ.get("B2_BUCKET_ID") or auth_data.get("allowed", {}).get("bucketId")
+    if not bucket_id:
+        lb_resp = requests.post(
+            f"{api_url}/b2api/v3/b2_list_buckets",
+            headers={"Authorization": auth_token},
+            json={"accountId": auth_data["accountId"], "bucketName": bucket},
+            timeout=30,
+        )
+        lb_resp.raise_for_status()
+        buckets = lb_resp.json().get("buckets", [])
+        if buckets:
+            bucket_id = buckets[0]["bucketId"]
+        else:
+            raise ValueError(f"B2 bucket '{bucket}' not found")
+
+    up_resp = requests.post(
+        f"{api_url}/b2api/v3/b2_get_upload_url",
+        headers={"Authorization": auth_token},
+        json={"bucketId": bucket_id},
+        timeout=30,
+    )
+    up_resp.raise_for_status()
+    up_data = up_resp.json()
+    upload_url = up_data["uploadUrl"]
+    upload_token = up_data["authorizationToken"]
+
+    sha1 = hashlib.sha1()
+    with open(file_path, "rb") as f:
+        while chunk := f.read(65536):
+            sha1.update(chunk)
+    digest = sha1.hexdigest()
+
+    file_size = file_path.stat().st_size
+    with open(file_path, "rb") as f:
+        res = requests.post(
+            upload_url,
+            headers={
+                "Authorization": upload_token,
+                "X-Bz-File-Name": urllib.parse.quote(target_key),
+                "Content-Type": content_type,
+                "Content-Length": str(file_size),
+                "X-Bz-Content-Sha1": digest,
+            },
+            data=f,
+            timeout=180,
+        )
+        res.raise_for_status()
+
+    public_prefix = os.environ.get("B2_PUBLIC_URL_PREFIX", "").rstrip("/")
+    if public_prefix:
+        return f"{public_prefix}/{target_key}"
+
+    return f"{download_url}/file/{bucket}/{target_key}"
+
 
 def _upload_uguu(file_path: pathlib.Path) -> str:
     """Upload to Uguu.se (up to 100MB, high speed)."""
@@ -135,29 +254,40 @@ def _upload_ucarecdn(file_path: pathlib.Path, pub_key: str = "demopublickey") ->
 
 
 def upload_with_fallback(file_path: pathlib.Path, catbox_hash: Optional[str] = None) -> Tuple[str, str]:
-    """Fallback chain: uguu -> catbox -> ucarecdn."""
+    """Fallback chain: Backblaze B2 (if configured) -> uguu -> catbox -> ucarecdn."""
     errors: List[str] = []
 
-    # 1. Try Uguu
+    # 1. Backblaze B2 (tmp/ auto-expire lifecycle)
+    if os.environ.get("B2_APPLICATION_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY"):
+        try:
+            url = _upload_b2(file_path, folder="tmp/audio")
+            return url, "backblaze_b2"
+        except Exception as exc:
+            print(f"⚠️ Backblaze B2 upload failed ({exc}), falling back to other uploaders...")
+            errors.append(f"b2: {exc}")
+
+    # 2. Try Uguu
     try:
         url = _upload_uguu(file_path)
         return url, "uguu"
     except Exception as exc:
         errors.append(f"uguu: {exc}")
 
-    # 2. Try Catbox
+    # 3. Try Catbox
     try:
         url = _upload_catbox(file_path, user_hash=catbox_hash)
         return url, "catbox"
     except Exception as exc:
         errors.append(f"catbox: {exc}")
 
-    # 3. Try Ucarecdn
+    # 4. Try Ucarecdn
     try:
         url = _upload_ucarecdn(file_path)
         return url, "ucarecdn"
     except Exception as exc:
         errors.append(f"ucarecdn: {exc}")
+
+    raise RuntimeError("All uploaders failed: " + " | ".join(errors))
 
     raise RuntimeError("All uploaders failed: " + " | ".join(errors))
 
@@ -234,6 +364,21 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         print(f"[{job_id}] 📥 Downloading audio from: {audio_url}")
         _download_file(audio_url, input_path)
         print(f"[{job_id}] 💾 Saved input audio ({input_path.stat().st_size} bytes)")
+
+        # Quick sanitize pass with ffmpeg to eliminate libmpg123 header junk & decode errors
+        sanitized_input = job_temp_dir / "sanitized_input.wav"
+        try:
+            res = subprocess.run(
+                ["ffmpeg", "-y", "-i", str(input_path), "-vn", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", str(sanitized_input)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+            )
+            if res.returncode == 0 and sanitized_input.exists() and sanitized_input.stat().st_size > 0:
+                input_path = sanitized_input
+                print(f"[{job_id}] 🧹 Sanitized input audio to clean PCM WAV")
+        except Exception as san_err:
+            print(f"[{job_id}] ℹ️ Audio sanitize pass skipped: {san_err}")
 
         # 2. Dynamic model switching if requested model is different
         if model_name != CURRENT_LOADED_MODEL:
